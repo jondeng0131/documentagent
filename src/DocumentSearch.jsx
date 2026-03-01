@@ -19,17 +19,44 @@ async function loadPdfJs() {
 }
 
 async function extractFromPDF(file) {
-  const pdfjsLib = await loadPdfJs();
-  const arrayBuffer = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  let fullText = "";
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const pageText = content.items.map(item => item.str).join(" ");
-    fullText += `[Page ${i}]\n${pageText}\n\n`;
+  // Try PDF.js first
+  try {
+    const pdfjsLib = await loadPdfJs();
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let fullText = "";
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map(item => item.str).join(" ");
+      fullText += `[Page ${i}]\n${pageText}\n\n`;
+    }
+    if (fullText.trim().length > 100) return fullText.trim();
+  } catch (e) {
+    console.warn("PDF.js failed, trying text fallback:", e);
   }
-  return fullText.trim();
+
+  // Fallback: try reading as raw text (works for text-based PDFs)
+  try {
+    const text = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = reject;
+      reader.readAsText(file);
+    });
+    // Extract readable ASCII text from raw PDF bytes
+    const readable = text.replace(/[^\x20-\x7E\n\r\t]/g, " ")
+      .replace(/\s+/g, " ")
+      .split(" ")
+      .filter(w => w.length > 2 && /[a-zA-Z]/.test(w))
+      .join(" ");
+    if (readable.length > 100) return readable;
+  } catch (e) {
+    console.warn("Text fallback failed:", e);
+  }
+
+  // Last resort: return filename as context so validator can use it
+  return `[PDF document: ${file.name}. Content extraction unavailable — validate based on filename and document name only.]`;
 }
 
 async function extractFromDOCX(file) {
@@ -88,16 +115,27 @@ function highlightKeywords(text, query) {
 
 async function validateInsuranceDocument(name, content) {
   const preview = content.slice(0, 3000);
+  const contentFailed = content.includes("Content extraction unavailable");
+
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: 200,
-      system: `You are a document classifier. Determine if a document is insurance-related.
-Insurance-related documents include: policies, claims, coverage summaries, endorsements, riders, certificates of insurance, premium schedules, exclusions, declarations pages, underwriting documents, loss runs, reinsurance documents, compliance filings, or any document that is primarily about insurance products, terms, or processes.
-Return ONLY valid JSON: { "is_insurance": true | false, "reason": "one sentence explanation", "document_type": "e.g. Policy Document / Claim Form / Coverage Summary / Not Insurance Related" }`,
-      messages: [{ role: "user", content: `Document name: ${name}\n\nContent preview:\n${preview}\n\nIs this an insurance-related document? Return JSON only.` }],
+      system: `You are a document classifier determining if a file is insurance-related or a PHR (Personal Health Record) containing insurance data.
+
+IMPORTANT RULES:
+1. The filename is a STRONG signal — names like "cigna", "aetna", "bluecross", "humana", "united", "anthem", "kaiser", "insurance", "coverage", "benefits", "policy", "claim", "deductible", "premium", "copay", "SBC", "EOB", "terms", "plan", "PHR", "health record" strongly indicate an acceptable document.
+2. If PDF text extraction failed or content is very short, rely heavily on the filename.
+3. ACCEPTED document types include:
+   - Pure insurance documents: health plans, dental plans, vision plans, life insurance, property insurance, liability insurance, workers comp, policies, claims, SBC (Summary of Benefits and Coverage), EOB (Explanation of Benefits), coverage summaries, certificates of insurance, endorsements, riders, declarations pages, premium schedules, underwriting docs, loss runs, reinsurance docs, compliance filings, glossaries of insurance terms.
+   - PHR (Personal Health Records) that contain ANY insurance-related data such as: insurance provider name, policy number, member ID, coverage details, benefits information, claims history, EOBs, deductibles, copays, or premium information.
+4. REJECT only documents that have NO insurance content whatsoever — e.g. a pure medical chart with only clinical notes and no insurance fields, a recipe, a resume, etc.
+5. When in doubt and the filename or content suggests insurance or health records — approve it.
+
+Return ONLY valid JSON: { "is_insurance": true | false, "reason": "one sentence explanation", "document_type": "specific type e.g. Health Insurance SBC / PHR with Insurance Data / Policy Glossary / Claim Form / Not Insurance Related" }`,
+      messages: [{ role: "user", content: `Filename: "${name}"\nContent extraction ${contentFailed ? "FAILED — use filename only" : "succeeded"}.\n\nContent preview:\n${preview}\n\nIs this insurance-related? Return JSON only.` }],
     }),
   });
   const data = await response.json();
@@ -127,6 +165,7 @@ STRICT RULES:
    - 0.5-0.69: Partial or tangentially related insurance information found
    - Below 0.5: Very weak match, likely not relevant
    - 0.0: Nothing found — return unknown
+7. Hide any PII data with data masking — e.g. replace member IDs, policy numbers, names with [REDACTED]
 
 Return ONLY valid JSON in this exact format:
 {
@@ -323,9 +362,9 @@ export default function App() {
               <span style={{ color: "#3b82f6" }}>documents.</span>
             </h1>
             <p style={{ fontSize: 13, color: "#64748b", lineHeight: 1.7, fontFamily: "'DM Mono', monospace" }}>
-              Insurance documents only — policies, claims, coverage summaries,<br />
-              certificates, endorsements & compliance filings.<br />
-              Supports <span style={{ color: "#94a3b8" }}>.pdf .docx .csv .txt .md</span> — non-insurance documents will be rejected.
+              Accepts insurance documents & PHR records with insurance data.<br />
+              Policies, claims, SBC, EOB, coverage summaries, PHR with member ID / benefits / claims history.<br />
+              Supports <span style={{ color: "#94a3b8" }}>.pdf .docx .csv .txt .md</span> — unrelated documents will be rejected.
             </p>
           </div>
 
@@ -384,7 +423,7 @@ export default function App() {
           {rejectedFiles.length > 0 && (
             <div style={{ marginBottom: 16, background: "#1c0b0b", border: "1px solid #7f1d1d", borderRadius: 8, padding: "14px 16px" }}>
               <div style={{ fontSize: 10, color: "#f87171", letterSpacing: "0.1em", marginBottom: 10 }}>
-                {rejectedFiles.length} DOCUMENT{rejectedFiles.length > 1 ? "S" : ""} REJECTED — NOT INSURANCE RELATED
+                {rejectedFiles.length} DOCUMENT{rejectedFiles.length > 1 ? "S" : ""} REJECTED — NO INSURANCE DATA FOUND
               </div>
               {rejectedFiles.map((r, i) => (
                 <div key={i} style={{ marginBottom: 8 }}>
