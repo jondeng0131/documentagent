@@ -1,5 +1,5 @@
 {
-  "name": "documentagent",
+  "name": "document-search",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -9,9 +9,7 @@
   },
   "dependencies": {
     "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "mammoth": "^1.7.0",
-    "pdfjs-dist": "^3.11.174"
+    "react-dom": "^18.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",
