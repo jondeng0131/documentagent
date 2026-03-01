@@ -1,5 +1,4 @@
 import { useState, useRef, useCallback } from "react";
-import * as mammoth from "mammoth";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -18,19 +17,42 @@ async function fetchWithTimeout(url, options, timeoutMs = 30000) {
   }
 }
 
-async function loadPdfJs() {
-  if (window.pdfjsLib) return window.pdfjsLib;
+// Load a script from CDN once, return promise
+function loadScript(src, globalName) {
+  if (window[globalName]) return Promise.resolve(window[globalName]);
   return new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-    script.onload = () => {
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-      resolve(window.pdfjsLib);
-    };
-    script.onerror = reject;
-    document.head.appendChild(script);
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      // Already loading — wait for it
+      existing.addEventListener("load", () => resolve(window[globalName]));
+      existing.addEventListener("error", reject);
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => resolve(window[globalName]);
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
   });
+}
+
+async function loadPdfJs() {
+  const lib = await loadScript(
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
+    "pdfjsLib"
+  );
+  if (lib && !lib.GlobalWorkerOptions.workerSrc) {
+    lib.GlobalWorkerOptions.workerSrc =
+      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  }
+  return lib;
+}
+
+async function loadMammoth() {
+  return loadScript(
+    "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js",
+    "mammoth"
+  );
 }
 
 async function extractFromPDF(file) {
@@ -48,10 +70,10 @@ async function extractFromPDF(file) {
     }
     if (fullText.trim().length > 100) return fullText.trim();
   } catch (e) {
-    console.warn("PDF.js failed, trying text fallback:", e);
+    console.warn("PDF.js failed, trying text fallback:", e.message);
   }
 
-  // Fallback: try reading as raw text (works for text-based PDFs)
+  // Fallback: read as raw text and extract ASCII
   try {
     const text = await new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -59,7 +81,6 @@ async function extractFromPDF(file) {
       reader.onerror = reject;
       reader.readAsText(file);
     });
-    // Extract readable ASCII text from raw PDF bytes
     const readable = text.replace(/[^\x20-\x7E\n\r\t]/g, " ")
       .replace(/\s+/g, " ")
       .split(" ")
@@ -67,17 +88,34 @@ async function extractFromPDF(file) {
       .join(" ");
     if (readable.length > 100) return readable;
   } catch (e) {
-    console.warn("Text fallback failed:", e);
+    console.warn("Text fallback failed:", e.message);
   }
 
-  // Last resort: return filename as context so validator can use it
-  return `[PDF document: ${file.name}. Content extraction unavailable — validate based on filename and document name only.]`;
+  return `[PDF document: ${file.name}. Content extraction unavailable — validate based on filename only.]`;
 }
 
 async function extractFromDOCX(file) {
-  const arrayBuffer = await file.arrayBuffer();
-  const result = await mammoth.extractRawText({ arrayBuffer });
-  return result.value.trim();
+  try {
+    const mammoth = await loadMammoth();
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    if (result && result.value && result.value.trim().length > 10) {
+      return result.value.trim();
+    }
+  } catch (e) {
+    console.warn("Mammoth DOCX failed:", e.message);
+  }
+  // Fallback: read as raw text
+  try {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result || "");
+      reader.onerror = reject;
+      reader.readAsText(file);
+    });
+  } catch {
+    return `[DOCX document: ${file.name}. Content extraction unavailable.]`;
+  }
 }
 
 function extractFromCSV(text) {
