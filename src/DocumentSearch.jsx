@@ -1013,7 +1013,7 @@ Return ONLY valid JSON:
             position: "absolute", top: 16, left: 12, zIndex: 10,
             width: 26, height: 26, borderRadius: 6,
             background: "#0f172a", border: "1px solid #1e293b",
-            color: "#64748b", cursor: "pointer", fontSize: 12,
+            color: "#64748b", cursor: "pointer", fontSize: 20,
             display: "flex", alignItems: "center", justifyContent: "center",
             transition: "all 0.15s", fontFamily: "monospace",
             lineHeight: 1,
