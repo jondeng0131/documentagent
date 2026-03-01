@@ -434,10 +434,15 @@ export default function App() {
   if (step === "upload") {
     return (
       <div style={{
-        minHeight: "100vh", background: "#060b14",
-        fontFamily: "'DM Mono', 'Fira Code', monospace",
-        display: "flex", flexDirection: "column", alignItems: "center",
-        justifyContent: "center", padding: 32,
+     minHeight: "100vh",
+    background: "#060b14",
+    color: "#ffffff", // 
+    fontFamily: "'DM Mono', 'Fira Code', monospace",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 32,
       }}>
         <style>{`
           @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&display=swap');
@@ -893,9 +898,12 @@ Return ONLY valid JSON:
 
   return (
     <div style={{
-      height: "100vh", background: "#060b14", overflow: "hidden",
+       height: "100vh",
+      background: "#060b14",
+      color: "#ffffff", // ✅ Option 1 global bright text
+      overflow: "hidden",
       fontFamily: "'DM Mono', 'Fira Code', monospace",
-      display: "grid", 
+      display: "grid",
       gridTemplateColumns: sidebarOpen ? "240px 1fr" : "0px 1fr",
       transition: "grid-template-columns 0.25s ease",
     }}>
