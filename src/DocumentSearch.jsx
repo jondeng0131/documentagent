@@ -184,7 +184,7 @@ IMPORTANT RULES:
 3. ACCEPTED document types include:
    - Pure insurance documents: health plans, dental plans, vision plans, life insurance, property insurance, liability insurance, workers comp, policies, claims, SBC (Summary of Benefits and Coverage), EOB (Explanation of Benefits), coverage summaries, certificates of insurance, endorsements, riders, declarations pages, premium schedules, underwriting docs, loss runs, reinsurance docs, compliance filings, glossaries of insurance terms.
    - PHR (Personal Health Records) that contain ANY insurance-related data such as: insurance provider name, policy number, member ID, coverage details, benefits information, claims history, EOBs, deductibles, copays, or premium information.
-4. REJECT only documents that have NO insurance content or PHR content whatsoever — e.g. a pure medical chart with only clinical notes and no patient medical history.
+4. REJECT only documents that have NO insurance content or PHR content whatsoever.
 5. When in doubt and the filename or content suggests insurance or health records — approve it.
 
 Return ONLY valid JSON: { "is_insurance": true | false, "reason": "one sentence explanation", "document_type": "specific type e.g. Health Insurance SBC / PHR with Insurance Data / Policy Glossary / Claim Form / Not Insurance Related" }`,
