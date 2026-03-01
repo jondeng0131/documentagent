@@ -167,6 +167,20 @@ function highlightKeywords(text, query) {
 // ─── Insurance Validation ───────────────────────────────────────────────────
 
 async function validateInsuranceDocument(name, content) {
+  const nameLower = name.toLowerCase();
+
+  // Fast-path: always accept PHR files without calling AI
+  const phrKeywords = ["phr", "health record", "medical record", "patient record", "clinical", "visit summary", "discharge", "lab result", "medication"];
+  if (phrKeywords.some(k => nameLower.includes(k))) {
+    return { is_insurance: true, reason: "PHR file accepted for doctor history analysis", document_type: "PHR Medical Record" };
+  }
+
+  // Fast-path: always accept obvious insurance files
+  const insuranceKeywords = ["cigna", "aetna", "humana", "united", "anthem", "bcbs", "bluecross", "kaiser", "insurance", "coverage", "benefits", "policy", "sbc", "eob", "deductible", "premium", "copay", "claim"];
+  if (insuranceKeywords.some(k => nameLower.includes(k))) {
+    return { is_insurance: true, reason: "Insurance document detected from filename", document_type: "Insurance Document" };
+  }
+
   const preview = content.slice(0, 3000);
   const contentFailed = content.includes("Content extraction unavailable");
 
@@ -176,18 +190,18 @@ async function validateInsuranceDocument(name, content) {
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
       max_tokens: 200,
-      system: `You are a document classifier determining if a file is insurance-related or a PHR (Personal Health Record) containing insurance data.
+      system: `You are a document classifier for a health insurance + PHR analysis tool. Determine if the file should be accepted.
 
-IMPORTANT RULES:
-1. The filename is a STRONG signal — names like "cigna", "aetna", "bluecross", "humana", "united", "anthem", "kaiser", "insurance", "coverage", "benefits", "policy", "claim", "deductible", "premium", "copay", "SBC", "EOB", "terms", "plan", "PHR", "health record" strongly indicate an acceptable document.
-2. If PDF text extraction failed or content is very short, rely heavily on the filename.
-3. ACCEPTED document types include:
-   - Pure insurance documents: health plans, dental plans, vision plans, life insurance, property insurance, liability insurance, workers comp, policies, claims, SBC (Summary of Benefits and Coverage), EOB (Explanation of Benefits), coverage summaries, certificates of insurance, endorsements, riders, declarations pages, premium schedules, underwriting docs, loss runs, reinsurance docs, compliance filings, glossaries of insurance terms.
-   - PHR (Personal Health Records) that contain ANY insurance-related data such as: insurance provider name, policy number, member ID, coverage details, benefits information, claims history, EOBs, deductibles, copays, or premium information.
-4. REJECT only documents that have NO insurance content or PHR content whatsoever.
-5. When in doubt and the filename or content suggests insurance or health records — approve it.
+ACCEPT if the file is ANY of:
+1. Insurance documents — health plans, SBC, EOB, coverage summaries, policies, claims, deductibles, copays, benefits, dental, vision, life, property, workers comp, endorsements, declarations, premium schedules, etc.
+2. PHR (Personal Health Records) — ANY medical record, patient health record, clinical notes, visit summaries, lab results, medication lists, doctor notes, discharge summaries. PHRs are ALWAYS accepted even if they contain zero insurance data — they are used to extract doctor visit history.
+3. Any file with "PHR", "health record", "medical record", "patient record", "visit", "clinical" in the filename.
 
-Return ONLY valid JSON: { "is_insurance": true | false, "reason": "one sentence explanation", "document_type": "specific type e.g. Health Insurance SBC / PHR with Insurance Data / Policy Glossary / Claim Form / Not Insurance Related" }`,
+REJECT only: recipes, resumes, spreadsheets, legal contracts, or files completely unrelated to health or insurance.
+
+IMPORTANT: The filename "${name}" contains "phr" — this is a PHR file and must be ACCEPTED.
+
+Return ONLY valid JSON: { "is_insurance": true | false, "reason": "one sentence explanation", "document_type": "Health Insurance SBC | PHR Medical Record | EOB | Policy | PHR with Insurance Data | Not Health Related" }`,
       messages: [{ role: "user", content: `Filename: "${name}"\nContent extraction ${contentFailed ? "FAILED — use filename only" : "succeeded"}.\n\nContent preview:\n${preview}\n\nIs this insurance-related? Return JSON only.` }],
     }),
   });
@@ -581,7 +595,7 @@ STRICT RULES:
 - Only extract doctors explicitly named in the documents
 - Count each distinct visit/encounter/mention as one occurrence
 - Identify specialty from context clues (e.g. "cardiology follow-up" → Cardiologist)
-- If no PHR data found, return recommended doctors from the search results. only return top 3 doctors that are recommended by the search results.
+- If no PHR data found, return empty doctors array
 
 Return ONLY valid JSON:
 {
@@ -669,40 +683,59 @@ Return ONLY valid JSON:
     const directory = resolveDirectory(insuranceProvider);
     const locationStr = location || "unknown location";
 
+    // Build explicit search instructions based on which insurer
+    const directoryInstructions = directory ? `
+MANDATORY SEARCH STEPS — follow in this exact order:
+
+STEP 1: Search the official ${directory.name} provider directory:
+- Search query: site:${new URL(directory.url).hostname} "${doctor.name}"
+- OR search: "${doctor.name}" "${insuranceProvider}" provider directory ${locationStr}
+
+STEP 2: Search the official directory URL directly:
+- URL to search: ${directory.url}
+- Search for the doctor by name: "${doctor.name}" and location: "${locationStr}"
+
+STEP 3: If steps 1-2 are inconclusive, search:
+- "${doctor.name}" ${doctor.specialty} ${locationStr} accepts ${insuranceProvider} 2025
+- "${doctor.name}" ${insuranceProvider} in-network ${locationStr}
+
+OFFICIAL DIRECTORY URL FOR PATIENT REFERENCE: ${directory.url}
+` : `
+SEARCH STEPS:
+STEP 1: Search "${doctor.name}" ${doctor.specialty} ${locationStr} accepts ${insuranceProvider} in-network 2025 2026
+STEP 2: Search "${doctor.name}" ${insuranceProvider} provider directory ${locationStr}
+`;
+
     const response = await fetchWithTimeout("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        system: `You are verifying whether a specific doctor accepts a specific health insurance plan. Use web_search with the exact official provider directory URL provided.
+        max_tokens: 1000,
+        system: `You are verifying whether a specific doctor accepts a specific health insurance plan. You MUST use the web_search tool to find current information. Do not guess or assume — only report what you actually find in search results.
 
-SEARCH STRATEGY (in order):
-1. First try fetching the official provider directory with the doctor's name and location
-2. Then search: "[Doctor name] [specialty] [location] accepts [insurance] in-network 2025 2026"
-3. Then search: "[Doctor name] [insurance provider] provider directory"
+${directoryInstructions}
 
-Use the EXACT directory URL provided. Include the patient's location in searches for accuracy.
-Report precisely what you found — do not guess or assume.
-
-Return ONLY valid JSON:
+After searching, return ONLY valid JSON (no other text):
 {
   "accepts_insurance": true | false | null,
   "confidence": "High | Medium | Low | Unknown",
-  "status_label": "Accepts [Insurance] | Does not accept [Insurance] | Likely in-network | Likely out-of-network | Could not verify",
-  "evidence": "Exact evidence found (quote from directory or search result)",
-  "directory_url": "The official directory URL to manually verify",
-  "source_url": "Specific URL found during search, or null",
-  "recommendation": "Concise action step for the patient e.g. 'Call office to confirm before booking'"
+  "status_label": "Accepts ${insuranceProvider} | Does not accept ${insuranceProvider} | Likely in-network | Likely out-of-network | Could not verify",
+  "evidence": "Exact quote or finding from search results — what specifically did you find?",
+  "source_url": "The URL where you found this information, or null",
+  "directory_url": "${directory?.url || ""}",
+  "recommendation": "One specific action for the patient, e.g. 'Call the office at XXX to confirm before booking' or 'Search ${directory?.name || insuranceProvider} directory at [url] to confirm'"
 }`,
         messages: [{
           role: "user",
-          content: `Doctor: ${doctor.name} (${doctor.specialty})
-Insurance: ${insuranceProvider || "unknown"} — ${planName || ""}
+          content: `Verify insurance acceptance for:
+Doctor: ${doctor.name}
+Specialty: ${doctor.specialty}
+Insurance: ${insuranceProvider || "unknown"} ${planName || ""}
 Patient location: ${locationStr}
-Official directory: ${directory ? directory.url : "No specific directory — use general web search"}
+${doctor.doctor_address ? `Doctor office address: ${doctor.doctor_address}` : ""}
 
-Search the official directory and web to verify if this doctor currently accepts this insurance in the patient's area. Return JSON only.`
+Use web_search to check the official directory and confirm if this doctor accepts this insurance. Return JSON only.`
         }],
         tools: [{ type: "web_search_20250305", name: "web_search" }],
       }),
@@ -713,7 +746,6 @@ Search the official directory and web to verify if this doctor currently accepts
     const clean = raw.replace(/```json|```/g, "").trim();
     try {
       const result = JSON.parse(clean);
-      // Always attach the official directory URL for manual verification
       return { ...doctor, ...result, official_directory: directory };
     } catch {
       return { ...doctor, accepts_insurance: null, confidence: "Unknown", status_label: "Could not verify", evidence: "Verification failed", official_directory: directory };
@@ -1638,4 +1670,5 @@ Return ONLY valid JSON:
     </div>
   );
 }
+
 
