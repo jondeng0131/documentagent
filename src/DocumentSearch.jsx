@@ -170,7 +170,7 @@ async function validateInsuranceDocument(name, content) {
   const preview = content.slice(0, 3000);
   const contentFailed = content.includes("Content extraction unavailable");
 
-  const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+  const response = await fetchWithTimeout("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -232,7 +232,7 @@ Return ONLY valid JSON in this exact format:
 
   const userMessage = `DOCUMENTS:\n${docContext}\n\nUSER QUERY: "${query}"\n\nSearch both by keyword matching AND contextual/semantic meaning. Return JSON only.`;
 
-  const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+  const response = await fetchWithTimeout("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -569,7 +569,7 @@ export default function App() {
 
   // Phase 1: Extract doctors + frequencies + patient address from PHR
   const extractDoctorsFromPHR = async (docContext) => {
-    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -669,7 +669,7 @@ Return ONLY valid JSON:
     const directory = resolveDirectory(insuranceProvider);
     const locationStr = location || "unknown location";
 
-    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -726,7 +726,7 @@ Search the official directory and web to verify if this doctor currently accepts
       `- ${d.name} (${d.specialty}): seen ${d.visit_count}x, treats [${(d.conditions_treated || []).join(", ")}], insurance status: ${d.status_label || "unknown"}, confidence: ${d.confidence || "unknown"}`
     ).join("\n");
 
-    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1638,3 +1638,4 @@ Return ONLY valid JSON:
     </div>
   );
 }
+
