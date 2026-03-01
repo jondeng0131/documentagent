@@ -3,6 +3,21 @@ import * as mammoth from "mammoth";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+// Fetch with timeout — prevents API calls hanging forever
+async function fetchWithTimeout(url, options, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error("Request timed out after " + timeoutMs / 1000 + "s");
+    throw e;
+  }
+}
+
 async function loadPdfJs() {
   if (window.pdfjsLib) return window.pdfjsLib;
   return new Promise((resolve, reject) => {
@@ -117,7 +132,7 @@ async function validateInsuranceDocument(name, content) {
   const preview = content.slice(0, 3000);
   const contentFailed = content.includes("Content extraction unavailable");
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -179,7 +194,7 @@ Return ONLY valid JSON in this exact format:
 
   const userMessage = `DOCUMENTS:\n${docContext}\n\nUSER QUERY: "${query}"\n\nSearch both by keyword matching AND contextual/semantic meaning. Return JSON only.`;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -254,7 +269,8 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [clarification, setClarification] = useState("");
+  const [collapsedItems, setCollapsedItems] = useState({});
+  const toggleCollapse = (id) => setCollapsedItems(prev => ({ ...prev, [id]: !prev[id] }));
   const [clarifications, setClarifications] = useState({});
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [recommendations, setRecommendations] = useState(null);
@@ -265,6 +281,9 @@ export default function App() {
   const dragRef = useRef(null);
   const resultsRef = useRef(null);
 
+  const handleDragRef = useRef(null);
+  const stopDragRef = useRef(null);
+
   const handleDrag = useCallback((e) => {
     const vh = window.innerHeight;
     const newPct = Math.round(((vh - e.clientY) / vh) * 100);
@@ -272,13 +291,15 @@ export default function App() {
   }, []);
 
   const stopDrag = useCallback(() => {
-    window.removeEventListener("mousemove", handleDrag);
-    window.removeEventListener("mouseup", stopDrag);
-  }, [handleDrag]);
+    window.removeEventListener("mousemove", handleDragRef.current);
+    window.removeEventListener("mouseup", stopDragRef.current);
+  }, []);
 
   const startDrag = useCallback(() => {
-    window.addEventListener("mousemove", handleDrag);
-    window.addEventListener("mouseup", stopDrag);
+    handleDragRef.current = handleDrag;
+    stopDragRef.current = stopDrag;
+    window.addEventListener("mousemove", handleDragRef.current);
+    window.addEventListener("mouseup", stopDragRef.current);
   }, [handleDrag, stopDrag]);
 
   const handleFiles = useCallback(async (fileList) => {
@@ -327,10 +348,16 @@ export default function App() {
     setLoading(true);
     try {
       const result = await searchDocuments(q, documents);
-      setHistory(prev => [{
-        id: Date.now(), query: q,
-        result, timestamp: new Date().toLocaleTimeString()
-      }, ...prev]);
+      setHistory(prev => {
+        // collapse all existing items
+        const newCollapsed = {};
+        prev.forEach(h => { newCollapsed[h.id] = true; });
+        setCollapsedItems(newCollapsed);
+        return [{
+          id: Date.now(), query: q,
+          result, timestamp: new Date().toLocaleTimeString()
+        }, ...prev];
+      });
       setQuery("");
       setClarification("");
     } catch (e) {
@@ -504,7 +531,7 @@ export default function App() {
 
   // Phase 1: Extract doctors + frequencies + patient address from PHR
   const extractDoctorsFromPHR = async (docContext) => {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -604,7 +631,7 @@ Return ONLY valid JSON:
     const directory = resolveDirectory(insuranceProvider);
     const locationStr = location || "unknown location";
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -661,7 +688,7 @@ Search the official directory and web to verify if this doctor currently accepts
       `- ${d.name} (${d.specialty}): seen ${d.visit_count}x, treats [${(d.conditions_treated || []).join(", ")}], insurance status: ${d.status_label || "unknown"}, confidence: ${d.confidence || "unknown"}`
     ).join("\n");
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -751,10 +778,22 @@ Return ONLY valid JSON:
         active_directory: directory,
       });
 
-      // Phase 2: verify each doctor in parallel with location + official directory
-      const verifiedDoctors = await Promise.all(
-        sortedDoctors.map(d => verifyDoctorInsurance(d, phrData.insurance_provider, phrData.plan_name, location))
-      );
+      // Phase 2: verify doctors with max 2 concurrent to prevent API overload
+      const concurrentVerify = async (doctors, concurrency = 2) => {
+        const results = [];
+        for (let i = 0; i < doctors.length; i += concurrency) {
+          const batch = doctors.slice(i, i + concurrency);
+          const batchResults = await Promise.all(
+            batch.map(d => verifyDoctorInsurance(d, phrData.insurance_provider, phrData.plan_name, location))
+          );
+          results.push(...batchResults);
+          // Update UI as each batch finishes
+          setRecommendations(prev => ({ ...prev, doctors_found: [...results, ...doctors.slice(i + concurrency)] }));
+        }
+        return results;
+      };
+
+      const verifiedDoctors = await concurrentVerify(sortedDoctors);
 
       setRecommendations({
         phase: "building",
@@ -999,7 +1038,7 @@ Return ONLY valid JSON:
                   </div>
                 </div>
               )}
-              {history.map((item) => {
+              {history.map((item, idx) => {
                 const { result } = item;
                 const isFound = result.state === "found";
                 const isPartial = result.state === "partial";
@@ -1008,101 +1047,129 @@ Return ONLY valid JSON:
                 const borderColor = isFound ? "#1d4ed860" : isPartial ? "#92400e60" : "#7f1d1d60";
                 const accentColor = isFound ? "#3b82f6" : isPartial ? "#fb923c" : "#f87171";
                 const stateLabel = isFound ? "FOUND" : isPartial ? "PARTIAL" : "UNKNOWN";
+                const isNewest = idx === 0;
+                const isCollapsed = collapsedItems[item.id] ?? false;
+
                 return (
                   <div key={item.id} className="result-card" style={{
                     background: "#080d17", border: `1px solid ${borderColor}`,
                     borderRadius: 10, overflow: "hidden", flexShrink: 0,
+                    opacity: isCollapsed ? 0.7 : 1,
+                    transition: "opacity 0.2s",
                   }}>
+                    {/* Header — always visible */}
                     <div style={{
-                      padding: "10px 16px", borderBottom: `1px solid ${borderColor}`,
+                      padding: "10px 16px", borderBottom: isCollapsed ? "none" : `1px solid ${borderColor}`,
                       display: "flex", alignItems: "center", justifyContent: "space-between",
                       background: `${accentColor}08`,
-                    }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      cursor: "pointer",
+                    }} onClick={() => toggleCollapse(item.id)}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+                        {/* Collapse toggle */}
+                        <div style={{
+                          width: 20, height: 20, borderRadius: 4, flexShrink: 0,
+                          background: "#0f172a", border: "1px solid #1e293b",
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          fontSize: 9, color: "#64748b", fontFamily: "monospace",
+                          transition: "all 0.15s",
+                        }}>
+                          {isCollapsed ? "→" : "←"}
+                        </div>
                         <span style={{
                           fontSize: 9, fontWeight: 700, letterSpacing: "0.1em",
-                          padding: "2px 7px", borderRadius: 4,
+                          padding: "2px 7px", borderRadius: 4, flexShrink: 0,
                           background: `${accentColor}20`, color: accentColor,
                           border: `1px solid ${accentColor}40`,
                         }}>{stateLabel}</span>
-                        <span style={{ fontSize: 11, color: "#e2e8f0" }}>"{item.query}"</span>
+                        <span style={{
+                          fontSize: 11, color: isCollapsed ? "#64748b" : "#e2e8f0",
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                          transition: "color 0.2s",
+                        }}>"{item.query}"</span>
+                        {isNewest && !isCollapsed && (
+                          <span style={{ fontSize: 8, color: "#3b82f6", letterSpacing: "0.08em", flexShrink: 0 }}>LATEST</span>
+                        )}
                       </div>
-                      <span style={{ fontSize: 9, color: "#334155" }}>{item.timestamp}</span>
+                      <span style={{ fontSize: 9, color: "#334155", flexShrink: 0, marginLeft: 8 }}>{item.timestamp}</span>
                     </div>
-                    <div style={{ padding: "16px" }}>
-                      {result.confidence > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                          <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 5 }}>CONFIDENCE</div>
-                          <ConfidenceMeter score={result.confidence} />
-                        </div>
-                      )}
-                      {lowConfidence && (
-                        <div style={{ background: "#431407", border: "1px solid #9a3412", borderRadius: 6, padding: "8px 12px", marginBottom: 12, fontSize: 11, color: "#fb923c", lineHeight: 1.6 }}>
-                          ⚠ Confidence below 70% — verify before relying on this result.
-                        </div>
-                      )}
-                      {(isFound || isPartial) && result.answer && (
-                        <div style={{ marginBottom: 12 }}>
-                          <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 6 }}>
-                            {isFound ? "ANSWER FROM DOCUMENTS" : "PARTIAL MATCH"}
+
+                    {/* Body — only shown when expanded */}
+                    {!isCollapsed && (
+                      <div style={{ padding: "16px" }}>
+                        {result.confidence > 0 && (
+                          <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 5 }}>CONFIDENCE</div>
+                            <ConfidenceMeter score={result.confidence} />
                           </div>
-                          <div style={{ background: "#0a1628", border: "1px solid #1e293b", borderRadius: 6, padding: "12px 14px", fontSize: 12, color: "#cbd5e1", lineHeight: 1.8 }}
-                            dangerouslySetInnerHTML={{ __html: highlightKeywords(result.answer, item.query) }} />
-                        </div>
-                      )}
-                      {result.sources?.length > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                          <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 6 }}>SOURCES</div>
-                          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                            {result.sources.map((s, i) => (
-                              <div key={i} style={{ background: "#0d1f35", border: "1px solid #1e3a5f", borderRadius: 6, padding: "7px 11px", fontSize: 11, color: "#7dd3fc", lineHeight: 1.6 }}
-                                dangerouslySetInnerHTML={{ __html: highlightKeywords(s, item.query) }} />
-                            ))}
+                        )}
+                        {lowConfidence && (
+                          <div style={{ background: "#431407", border: "1px solid #9a3412", borderRadius: 6, padding: "8px 12px", marginBottom: 12, fontSize: 11, color: "#fb923c", lineHeight: 1.6 }}>
+                            ⚠ Confidence below 70% — verify before relying on this result.
                           </div>
-                        </div>
-                      )}
-                      {result.keywords_matched?.length > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                          <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 5 }}>KEYWORDS MATCHED</div>
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-                            {result.keywords_matched.map((k, i) => (
-                              <span key={i} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: "#1d4ed820", color: "#93c5fd", border: "1px solid #1d4ed840" }}>{k}</span>
-                            ))}
+                        )}
+                        {(isFound || isPartial) && result.answer && (
+                          <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 6 }}>
+                              {isFound ? "ANSWER FROM DOCUMENTS" : "PARTIAL MATCH"}
+                            </div>
+                            <div style={{ background: "#0a1628", border: "1px solid #1e293b", borderRadius: 6, padding: "12px 14px", fontSize: 12, color: "#cbd5e1", lineHeight: 1.8 }}
+                              dangerouslySetInnerHTML={{ __html: highlightKeywords(result.answer, item.query) }} />
                           </div>
-                        </div>
-                      )}
-                      {isUnknown && (
-                        <div>
-                          <div style={{ background: "#1c0b0b", border: "1px solid #7f1d1d", borderRadius: 8, padding: "14px", marginBottom: 12 }}>
-                            <div style={{ fontSize: 11, color: "#fca5a5", marginBottom: 5, fontWeight: 600 }}>✕ Not found in documents</div>
-                            {result.reason_if_unknown && <div style={{ fontSize: 11, color: "#f1f5f9", lineHeight: 1.6 }}>{result.reason_if_unknown}</div>}
-                            {result.needs_more_info && <div style={{ fontSize: 11, color: "#64748b", marginTop: 6, lineHeight: 1.6 }}><span style={{ color: "#f87171" }}>To help: </span>{result.needs_more_info}</div>}
+                        )}
+                        {result.sources?.length > 0 && (
+                          <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 6 }}>SOURCES</div>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                              {result.sources.map((s, i) => (
+                                <div key={i} style={{ background: "#0d1f35", border: "1px solid #1e3a5f", borderRadius: 6, padding: "7px 11px", fontSize: 11, color: "#7dd3fc", lineHeight: 1.6 }}
+                                  dangerouslySetInnerHTML={{ __html: highlightKeywords(s, item.query) }} />
+                              ))}
+                            </div>
                           </div>
-                          <div style={{ display: "flex", gap: 8 }}>
-                            <input type="text" placeholder="Add context and retry..." 
-                              value={clarifications[item.id] || ""}
-                              onChange={e => setClarifications(prev => ({ ...prev, [item.id]: e.target.value }))}
-                              onKeyDown={e => e.key === "Enter" && handleClarification(item)}
-                              style={{ flex: 1, background: "#080d17", border: "1px solid #1e293b", borderRadius: 6, padding: "9px 12px", color: "#e2e8f0", fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
-                            <button 
-                              onClick={() => handleClarification(item)} 
-                              disabled={!(clarifications[item.id] || "").trim() || loading}
-                              style={{ 
-                                padding: "9px 16px", 
-                                background: (clarifications[item.id] || "").trim() ? "linear-gradient(135deg, #1d4ed8, #3b82f6)" : "#1c1917", 
-                                border: "none", borderRadius: 6, 
-                                color: "#fff", fontSize: 10, 
-                                cursor: (clarifications[item.id] || "").trim() && !loading ? "pointer" : "not-allowed", 
-                                fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em",
-                                transition: "all 0.2s",
-                                boxShadow: (clarifications[item.id] || "").trim() ? "0 0 12px #1d4ed840" : "none",
-                              }}>
-                              RETRY →
-                            </button>
+                        )}
+                        {result.keywords_matched?.length > 0 && (
+                          <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.1em", marginBottom: 5 }}>KEYWORDS MATCHED</div>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                              {result.keywords_matched.map((k, i) => (
+                                <span key={i} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 4, background: "#1d4ed820", color: "#93c5fd", border: "1px solid #1d4ed840" }}>{k}</span>
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      )}
-                    </div>
+                        )}
+                        {isUnknown && (
+                          <div>
+                            <div style={{ background: "#1c0b0b", border: "1px solid #7f1d1d", borderRadius: 8, padding: "14px", marginBottom: 12 }}>
+                              <div style={{ fontSize: 11, color: "#fca5a5", marginBottom: 5, fontWeight: 600 }}>✕ Not found in documents</div>
+                              {result.reason_if_unknown && <div style={{ fontSize: 11, color: "#f1f5f9", lineHeight: 1.6 }}>{result.reason_if_unknown}</div>}
+                              {result.needs_more_info && <div style={{ fontSize: 11, color: "#64748b", marginTop: 6, lineHeight: 1.6 }}><span style={{ color: "#f87171" }}>To help: </span>{result.needs_more_info}</div>}
+                            </div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <input type="text" placeholder="Add context and retry..."
+                                value={clarifications[item.id] || ""}
+                                onChange={e => setClarifications(prev => ({ ...prev, [item.id]: e.target.value }))}
+                                onKeyDown={e => e.key === "Enter" && handleClarification(item)}
+                                style={{ flex: 1, background: "#080d17", border: "1px solid #1e293b", borderRadius: 6, padding: "9px 12px", color: "#e2e8f0", fontSize: 11, fontFamily: "'DM Mono', monospace" }} />
+                              <button
+                                onClick={() => handleClarification(item)}
+                                disabled={!(clarifications[item.id] || "").trim() || loading}
+                                style={{
+                                  padding: "9px 16px",
+                                  background: (clarifications[item.id] || "").trim() ? "linear-gradient(135deg, #1d4ed8, #3b82f6)" : "#1c1917",
+                                  border: "none", borderRadius: 6,
+                                  color: "#fff", fontSize: 10,
+                                  cursor: (clarifications[item.id] || "").trim() && !loading ? "pointer" : "not-allowed",
+                                  fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em",
+                                  transition: "all 0.2s",
+                                  boxShadow: (clarifications[item.id] || "").trim() ? "0 0 12px #1d4ed840" : "none",
+                                }}>
+                                RETRY →
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 );
               })}
